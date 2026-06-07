@@ -256,6 +256,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text
     user_id = update.effective_user.id
     
+    # Проверка на ожидание ввода факта
+    if context.user_data.get('waiting_for_fact'):
+        await handle_fact_input(update, context)
+        return
+    
+    # Проверка на ожидание рассылки
+    if context.user_data.get('waiting_for_broadcast'):
+        await handle_broadcast_input(update, context)
+        return
+    
     if text == "🐾 Получить факт":
         await get_fact(update, context)
     elif text == "🐱 Выбрать животное":
@@ -279,6 +289,111 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=reply_markup
         )
 
+# Обработка ввода факта
+async def handle_fact_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка ввода факта от администратора"""
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    if user_id not in user_stats['admin_users']:
+        await update.message.reply_text("❌ Доступ запрещён.")
+        context.user_data['waiting_for_fact'] = False
+        return
+    
+    try:
+        # Парсим формат: категория|текст факта|источник
+        parts = text.split('|')
+        if len(parts) != 3:
+            await update.message.reply_text(
+                "❌ Неправильный формат!\n\n"
+                "Используй: категория|текст факта|источник\n\n"
+                "Примеры категорий: cats, dogs, wild, birds, reptiles, insects, marine"
+            )
+            return
+        
+        category, fact_text, source = [p.strip() for p in parts]
+        
+        # Проверяем категорию
+        facts = load_facts()
+        if category not in facts:
+            await update.message.reply_text(
+                f"❌ Категория '{category}' не существует!\n\n"
+                "Доступные категории: cats, dogs, wild, birds, reptiles, insects, marine"
+            )
+            return
+        
+        # Добавляем факт
+        new_fact = {
+            "text": fact_text,
+            "source": source
+        }
+        facts[category].append(new_fact)
+        
+        # Добавляем в категорию 'all'
+        facts['all'].append(new_fact)
+        
+        # Сохраняем
+        save_facts(facts)
+        context.user_data['waiting_for_fact'] = False
+        
+        await update.message.reply_text(
+            f"✅ Факт успешно добавлен в категорию '{category}'!"
+        )
+        logger.info(f"Администратор {user_id} добавил новый факт в категорию '{category}'")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении факта: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+# Обработка ввода рассылки
+async def handle_broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка ввода сообщения для рассылки"""
+    user_id = update.effective_user.id
+    message_text = update.message.text
+    
+    if user_id not in user_stats['admin_users']:
+        await update.message.reply_text("❌ Доступ запрещён.")
+        context.user_data['waiting_for_broadcast'] = False
+        return
+    
+    try:
+        users = get_all_users()
+        context.user_data['waiting_for_broadcast'] = False
+        
+        if not users:
+            await update.message.reply_text("❌ Нет пользователей для рассылки.")
+            return
+        
+        # Отправляем сообщение всем пользователям
+        success_count = 0
+        error_count = 0
+        
+        for user in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=user,
+                    text=message_text,
+                    parse_mode='Markdown'
+                )
+                success_count += 1
+            except Exception as e:
+                logger.warning(f"Не удалось отправить сообщение пользователю {user}: {e}")
+                error_count += 1
+        
+        # Отправляем отчёт администратору
+        report = (
+            f"📢 *Рассылка завершена!*\n\n"
+            f"✅ Успешно отправлено: {success_count}\n"
+            f"❌ Ошибок: {error_count}\n"
+            f"👥 Всего пользователей: {len(users)}"
+        )
+        await update.message.reply_text(report, parse_mode='Markdown')
+        logger.info(f"Администратор {user_id} отправил рассылку: успешно {success_count}, ошибок {error_count}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при рассылке: {e}")
+        await update.message.reply_text(f"❌ Ошибка при рассылке: {str(e)}")
+
 # Статистика (для всех)
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать статистику"""
@@ -291,7 +406,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     await update.message.reply_text(stats_text, parse_mode='Markdown')
 
-# Админ команды
+# Админ команды - статистика
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /stats - статистика (только для админов)"""
     user_id = update.effective_user.id
@@ -321,8 +436,11 @@ async def add_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     await update.message.reply_text(
         "📝 Пожалуйста, отправь факт в формате:\n"
-        "категория|текст факта|источник\n\n"
-        "Категории: cats, dogs, wild, birds, reptiles, insects, marine"
+        "`категория|текст факта|источник`\n\n"
+        "*Категории:* cats, dogs, wild, birds, reptiles, insects, marine\n\n"
+        "*Пример:*\n"
+        "`cats|Кошки видят в темноте в 6 раз лучше|Wikipedia`",
+        parse_mode='Markdown'
     )
     context.user_data['waiting_for_fact'] = True
 
@@ -336,7 +454,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     await update.message.reply_text(
-        "📢 Отправь сообщение для рассылки всем пользователям:"
+        "📢 Отправь сообщение для рассылки всем пользователям:\n\n"
+        "_(Можно использовать форматирование Markdown: *жирный*, _курсив_, `код`)_",
+        parse_mode='Markdown'
     )
     context.user_data['waiting_for_broadcast'] = True
 
